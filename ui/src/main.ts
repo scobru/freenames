@@ -22,13 +22,13 @@ const act = (btn: string, out: string, f: () => Promise<string | void>) => {
   };
 };
 
-// route: #/ resolve | #/go/<name> | #/mine | #/how | #/admin (not linked anywhere); ?whoiam=... is whoiam's callback
+// route: #/ resolve | #/go/<name> | #/mine | #/how | #/admin (not linked anywhere); ?viso=... or ?whoiam=... is callback
 function route() {
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
   const h = location.hash;
   document.querySelectorAll<HTMLElement>("[data-nav]").forEach((a) => a.toggleAttribute("aria-current", a.getAttribute("href") === (h || "#/")));
   const q = new URLSearchParams(location.search);
-  if (q.has("whoiam")) return signInCallback(q);
+  if (q.has("viso") || q.has("whoiam")) return signInCallback(q);
   if (h === "#/mine") return minePage();
   if (h === "#/how") return howPage();
   if (h === "#/admin") return adminPage();
@@ -49,7 +49,7 @@ function resolvePage(initial: string) {
     const exact = $("#exact");
     try {
       const r = await resolve(q);
-      const who = r.owner ? `owner: whoiam persona <code title="${r.owner}">${esc(personaName(r.owner))}</code> (via ${r.via})` : "";
+      const who = r.owner ? `owner: Viso persona <code title="${r.owner}">${esc(personaName(r.owner))}</code> (via ${r.via})` : "";
       exact.innerHTML = !r.owner ? `<p class="muted">No exact match for <code>${esc(q)}</code>.</p>`
         : r.target
           ? `<div class="card"><p><a class="btn primary" href="${webUrl(r.target)}" target="_blank" rel="noopener">Open ${esc(q)}</a></p>
@@ -93,10 +93,10 @@ async function minePage() {
   catch (e) { $("#box").innerHTML = `<p class="err">Could not reach the node: ${esc(String((e as Error).message ?? e))}</p>`; return; }
   if (!me) {
     $("#box").innerHTML = `
-      <p class="muted">Your names belong to your <b>whoiam</b> persona. Sign in once on this node: whoiam opens, you pick a persona, and it lets this app write on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
-      <div class="row"><input id="wurl" value="${esc(officialWhoiam())}" spellcheck="false" autocomplete="off" /><button id="wgo" class="primary">Sign in with whoiam</button></div>
+      <p class="muted">Your names belong to your <b>Viso</b> persona. Sign in once on this node: Viso opens, you pick a persona, and it lets this app write on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
+      <div class="row"><input id="wurl" value="${esc(officialWhoiam())}" spellcheck="false" autocomplete="off" /><button id="wgo" class="primary">Sign in with Viso</button></div>
       <p id="wo"></p>`;
-    act("#wgo", "#wo", async () => { goTo(await startSignIn(val("#wurl"))); return "Opening whoiam…"; });
+    act("#wgo", "#wo", async () => { goTo(await startSignIn(val("#wurl"))); return "Opening Viso…"; });
     return;
   }
   const pk = me.persona;
@@ -104,7 +104,7 @@ async function minePage() {
   $("#box").innerHTML = `
     <div class="card">
       <h2>Signed in</h2>
-      <p>whoiam persona <code>${esc(personaName(pk))}</code></p>
+      <p>Viso persona <code>${esc(personaName(pk))}</code></p>
       <p class="muted"><small>Your persona key: <code class="wrap">${pk}</code>. Others can always reach your names as <code>&lt;this key&gt;/name</code>, even without the registry.</small></p>
       <p><button id="so">Sign out</button></p>
     </div>
@@ -185,14 +185,14 @@ async function minePage() {
 // Inside the node's container the page is a sandboxed iframe: leaving it goes through the shell.
 const goTo = (href: string) => (window.parent !== window ? parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*") : void (location.href = href));
 
-/** whoiam sent the user back here with its proof (or a refusal). */
+/** Viso sent the user back here with its proof (or a refusal). */
 async function signInCallback(q: URLSearchParams) {
-  app.innerHTML = `<h1>whoiam</h1><p class="muted">Checking the proof…</p>`;
+  app.innerHTML = `<h1>Viso</h1><p class="muted">Checking the proof…</p>`;
   let html: string;
   try { html = `<p>Signed in as the persona <code>${esc(personaName(await finishSignIn(q)))}</code>.</p>`; }
   catch (e) { html = `<p class="err">${esc(String((e as Error).message ?? e))}</p>`; }
   history.replaceState(null, "", `${location.pathname}#/mine`); // drop the one-time query
-  app.innerHTML = `<h1>whoiam</h1>${html}<p><a class="btn primary" href="#/mine">Go to My names</a></p>`;
+  app.innerHTML = `<h1>Viso</h1>${html}<p><a class="btn primary" href="#/mine">Go to My names</a></p>`;
 }
 
 // ---------------- how it works ----------------
@@ -201,8 +201,8 @@ function howPage() {
     <h1>How it works</h1>
     <p>Freenet addresses look like <code>6s9q7nSCmPrHY85RfPjQpdHo7WTFabDCTtsJAzHXfuLN</code>. FreeNames lets you type <code>scobru</code> or <code>scobru/freetunes</code> instead.</p>
     <div class="card">
-      <h2>1. Your identity is your whoiam persona</h2>
-      <p>You sign in with <b>whoiam</b> once per node. whoiam signs a short delegation: "this app key, kept by your node, may write for me in FreeNames". Every change carries that delegation and the app key's signature, and the contracts check both. Your names belong to the persona, not to the app key: if you lose your node, sign in again from another one. No key or seed is shared and there is nothing to back up here.</p>
+      <h2>1. Your identity is your Viso persona</h2>
+      <p>You sign in with <b>Viso</b> once per node. Viso signs a short delegation: "this app key, kept by your node, may write for me in FreeNames". Every change carries that delegation and the app key's signature, and the contracts check both. Your names belong to the persona, not to the app key: if you lose your node, sign in again from another one. No key or seed is shared and there is nothing to back up here.</p>
     </div>
     <div class="card">
       <h2>2. Your zone: names under your persona</h2>
