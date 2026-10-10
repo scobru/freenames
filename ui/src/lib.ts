@@ -353,5 +353,6 @@ export async function resolve(input: string): Promise<Resolution> {
   return { owner, via, sub: p.sub, target };
 }
 
-/** Where the node serves a contract's web app. */
-export const webUrl = (id: string) => `${location.protocol}//${location.host}/v1/contract/web/${id}/`;
+/** Where the node serves a contract's web app (in dev the page is on Vite, the node elsewhere). */
+export const webUrl = (id: string) =>
+  `${import.meta.env.DEV ? `http://${import.meta.env.VITE_NODE ?? "127.0.0.1:7509"}` : `${location.protocol}//${location.host}`}/v1/contract/web/${id}/`;
