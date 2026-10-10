@@ -378,8 +378,9 @@ export async function resolve(input: string): Promise<Resolution> {
 export interface Hit { name: string; target: string; owner: string }
 const MAX_SEARCH_OWNERS = 100;
 
-/** Names containing `q` (lowercase): petnames and registry names, with their owners' sub-names. Hits arrive as zones load. */
-export async function search(q: string, onHit: (h: Hit) => void) {
+/** Names containing `q` (lowercase; "" = all): petnames and registry names, with their owners' sub-names. Hits arrive as zones load; stops after `max`. */
+export async function search(q: string, onHit: (h: Hit) => void, max = Infinity) {
+  let n = 0;
   const pets = await loadPetnames(), reg = await loadRegistry();
   const labels = new Map<string, string>(); // label -> owner; petnames win, as in `resolve`
   for (const n of [...Object.keys(reg.claims), ...Object.keys(reg.pins.map)]) {
@@ -393,7 +394,7 @@ export async function search(q: string, onHit: (h: Hit) => void) {
     if (!zones.has(owner)) zones.set(owner, loadZone(owner).catch(() => null));
     for (const [sub, r] of Object.entries((await zones.get(owner)!)?.records ?? {})) {
       const name = sub === ROOT ? label : `${label}/${sub}`;
-      if (r.target && name.includes(q)) onHit({ name, target: r.target, owner });
+      if (r.target && name.includes(q)) { onHit({ name, target: r.target, owner }); if (++n >= max) return; }
     }
   }
 }

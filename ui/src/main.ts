@@ -74,7 +74,15 @@ function resolvePage(initial: string) {
     history.replaceState(null, "", `#/go/${encodeURIComponent(val("#q"))}`);
     run(val("#q"));
   };
-  if (initial) run(initial);
+  if (initial) return void run(initial);
+  // no query: list the first registered sites (registry order), so there is something to browse
+  $("#out").innerHTML = `<h2>Registered sites</h2><ul id="rl"></ul><p class="muted" id="rs">Loading…</p>`;
+  let count = 0;
+  search("", (h) => {
+    count++;
+    app.querySelector("#rl")?.insertAdjacentHTML("beforeend", `<li><a href="${webUrl(h.target)}" target="_blank" rel="noopener"><code>${esc(h.name)}</code></a> <small class="muted">by ${esc(personaName(h.owner).slice(0, 10))}…</small></li>`);
+  }, 50).then(() => { const s = app.querySelector("#rs"); if (s) s.textContent = count ? "" : "No sites registered yet."; },
+    (e) => { const s = app.querySelector("#rs"); if (s) s.textContent = String((e as Error).message ?? e); });
 }
 
 // ---------------- my names ----------------
