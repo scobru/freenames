@@ -6,7 +6,7 @@ export interface Claim { nonce: number; sig: string }
 export interface Pins { ts: number; map: Record<string, string>; sig: string }
 export interface RegState { claims: Record<string, Record<string, Claim>>; pins: Pins }
 export interface ZoneRecord { target: string; ts: number; sig: string }
-export interface Zone { records: Record<string, ZoneRecord> }
+export interface Zone { records: Record<string, ZoneRecord>; persona?: { proof: string; ts: number; sig: string } }
 
 export const ROOT = "@";
 const enc = new TextEncoder();
@@ -17,6 +17,7 @@ export const isKey = (s: string) => /^[0-9a-f]{64}$/.test(s);
 
 export const claimMsg = (admin: string, name: string, owner: string) => `fnc1|${admin}|${name}|${owner}`;
 export const zoneMsg = (owner: string, name: string, target: string, ts: number) => `fnz1|${owner}|${name}|${target}|${ts}`;
+export const personaMsg = (owner: string, proof: string, ts: number) => `fnw1|${owner}|${proof}|${ts}`;
 export const pinsMsg = (p: Pick<Pins, "ts" | "map">) =>
   `fnp1|${p.ts}|${Object.keys(p.map).sort().map((n) => `${n}=${p.map[n]}`).join(",")}`;
 

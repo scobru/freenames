@@ -1,7 +1,8 @@
 //! Zone: the names one key publishes. Parameters = the owner's ed25519 pubkey (32 bytes), so anyone who
 //! knows the key can find the zone. Each record maps a name to a contract instance id and is signed by
 //! the owner; the newest record per name wins, and an empty target is a tombstone. `@` is the zone's
-//! own root (what the bare name resolves to). State is JSON.
+//! own root (what the bare name resolves to). The owner can also publish a whoiam proof (a persona vouching
+//! for this key); the contract only checks the owner's signature, viewers verify the proof. State is JSON.
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ use std::collections::BTreeMap;
 
 pub const ROOT: &str = "@";
 pub const MAX_RECORDS: usize = 1000;
+const MAX_PROOF: usize = 2000;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Record {
@@ -17,12 +19,28 @@ pub struct Record {
     pub sig: String, // hex, by the owner over `fnz1|<owner>|<name>|<target>|<ts>`
 }
 
+/// A whoiam "sign in" proof as JSON (empty = unlinked). Newest wins, like a record.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Persona {
+    pub proof: String,
+    pub ts: u64,
+    pub sig: String, // hex, by the owner over `fnw1|<owner>|<proof>|<ts>`
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Zone {
     pub records: BTreeMap<String, Record>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<Persona>,
 }
 
-pub type Summary = BTreeMap<String, u64>;
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Summary {
+    #[serde(default)]
+    pub records: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub persona_ts: Option<u64>,
+}
 
 pub type R<T> = Result<T, String>;
 
@@ -63,6 +81,13 @@ fn check_record(owner: &str, name: &str, r: &Record) -> R<()> {
     verify(&key(owner)?, format!("fnz1|{owner}|{name}|{}|{}", r.target, r.ts).as_bytes(), &r.sig)
 }
 
+fn check_persona(owner: &str, p: &Persona) -> R<()> {
+    if p.proof.len() > MAX_PROOF {
+        return Err("proof too long".into());
+    }
+    verify(&key(owner)?, format!("fnw1|{owner}|{}|{}", p.proof, p.ts).as_bytes(), &p.sig)
+}
+
 /// Does `new` replace `old`? Newer wins; equal times fall back to the signature so every merge order agrees.
 fn newer(new: &Record, old: &Record) -> bool {
     (new.ts, &new.sig) > (old.ts, &old.sig)
@@ -72,10 +97,17 @@ pub fn validate(owner: &str, z: &Zone) -> R<()> {
     if z.records.len() > MAX_RECORDS {
         return Err("too many records".into());
     }
+    z.persona.iter().try_for_each(|p| check_persona(owner, p))?;
     z.records.iter().try_for_each(|(n, r)| check_record(owner, n, r))
 }
 
 pub fn apply(owner: &str, z: &mut Zone, d: Zone) -> R<()> {
+    if let Some(p) = d.persona {
+        if z.persona.as_ref().is_none_or(|old| (p.ts, &p.sig) > (old.ts, &old.sig)) {
+            check_persona(owner, &p)?;
+            z.persona = Some(p);
+        }
+    }
     for (name, r) in d.records {
         if z.records.get(&name).is_some_and(|old| !newer(&r, old)) {
             continue;
@@ -90,7 +122,7 @@ pub fn apply(owner: &str, z: &mut Zone, d: Zone) -> R<()> {
 }
 
 pub fn summarize(z: &Zone) -> Summary {
-    z.records.iter().map(|(n, r)| (n.clone(), r.ts)).collect()
+    Summary { records: z.records.iter().map(|(n, r)| (n.clone(), r.ts)).collect(), persona_ts: z.persona.as_ref().map(|p| p.ts) }
 }
 
 pub fn delta(z: &Zone, sum: &Summary) -> Zone {
@@ -98,9 +130,10 @@ pub fn delta(z: &Zone, sum: &Summary) -> Zone {
         records: z
             .records
             .iter()
-            .filter(|(n, r)| sum.get(*n).is_none_or(|&t| t <= r.ts)) // equal ts may still differ: let the receiver decide
+            .filter(|(n, r)| sum.records.get(*n).is_none_or(|&t| t <= r.ts)) // equal ts may still differ: let the receiver decide
             .map(|(n, r)| (n.clone(), r.clone()))
             .collect(),
+        persona: z.persona.clone().filter(|p| sum.persona_ts.is_none_or(|t| t <= p.ts)),
     }
 }
 
@@ -192,7 +225,27 @@ mod tests {
     }
     fn rec(k: &SigningKey, name: &str, target: &str, ts: u64) -> Zone {
         let sig = hex::encode(k.sign(format!("fnz1|{}|{name}|{target}|{ts}", pk(k)).as_bytes()).to_bytes());
-        Zone { records: [(name.into(), Record { target: target.into(), ts, sig })].into() }
+        Zone { records: [(name.into(), Record { target: target.into(), ts, sig })].into(), persona: None }
+    }
+    fn persona(k: &SigningKey, proof: &str, ts: u64) -> Zone {
+        let sig = hex::encode(k.sign(format!("fnw1|{}|{proof}|{ts}", pk(k)).as_bytes()).to_bytes());
+        Zone { records: Default::default(), persona: Some(Persona { proof: proof.into(), ts, sig }) }
+    }
+
+    #[test]
+    fn persona_is_owner_signed_and_newest_wins() {
+        let k = sk(1);
+        let o = pk(&k);
+        let mut z = Zone::default();
+        apply(&o, &mut z, persona(&k, "{\"pk\":\"aa\"}", 10)).unwrap();
+        apply(&o, &mut z, persona(&k, "", 20)).unwrap(); // unlinked
+        apply(&o, &mut z, persona(&k, "{\"pk\":\"aa\"}", 10)).unwrap(); // an old link cannot come back
+        assert_eq!(z.persona.as_ref().unwrap().proof, "");
+        assert!(apply(&o, &mut z, persona(&sk(2), "x", 30)).is_err()); // not the owner
+        assert!(apply(&o, &mut z, persona(&k, &"x".repeat(MAX_PROOF + 1), 30)).is_err());
+        validate(&o, &z).unwrap();
+        assert!(delta(&z, &summarize(&z)).persona.is_some()); // same ts: sent, the receiver keeps one
+        assert!(delta(&z, &Summary { persona_ts: Some(21), ..Default::default() }).persona.is_none());
     }
 
     #[test]
@@ -214,7 +267,8 @@ mod tests {
         validate(&o, &z).unwrap();
         // delta vs summary
         assert!(delta(&z, &Summary::default()).records.len() == 2);
-        assert!(delta(&z, &[("music".to_string(), 31)].into()).records.keys().eq([ROOT]));
+        let sum = Summary { records: [("music".to_string(), 31)].into(), persona_ts: None };
+        assert!(delta(&z, &sum).records.keys().eq([ROOT]));
     }
 
     #[test]

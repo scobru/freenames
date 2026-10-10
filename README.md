@@ -20,7 +20,7 @@ Resolution: `first/sub` → `first` is a 64-hex key, else your petname, else the
 
 | Contract | What it holds | Address |
 | --- | --- | --- |
-| **Zone** (`zone/`) | The names one key publishes: name → contract id, each record signed by the owner (`fnz1\|<owner>\|<name>\|<target>\|<ts>`). Newest record per name wins; an empty target is a tombstone. Up to 1000 records. | parameters = owner public key, so anyone who knows the key finds the zone |
+| **Zone** (`zone/`) | The names one key publishes: name → contract id, each record signed by the owner (`fnz1\|<owner>\|<name>\|<target>\|<ts>`). Newest record per name wins; an empty target is a tombstone. Up to 1000 records. Optionally a whoiam proof, signed by the owner (`fnw1\|<owner>\|<proof>\|<ts>`). | parameters = owner public key, so anyone who knows the key finds the zone |
 | **Registry** (`registry/`) | Claims: name → owner key, signed by the owner (`fnc1\|<admin>\|<name>\|<owner>`) with an 18-bit sha256 proof-of-work. Admin-signed pins (`fnp1\|<ts>\|name=owner,...`). | one shared instance (its parameter is the admin public key) |
 | **Identity delegate** (`identity/`) | Your signing key and a small store (petnames). Same delegate as FreeTunes. | one per calling web app |
 
@@ -32,6 +32,10 @@ Resolution: `first/sub` → `first` is a 64-hex key, else your petname, else the
 The contract keeps the 3 strongest owners per name and the 5000 strongest claims overall. That is a union under a total order, so every merge order converges, and pins never delete claims (unpinning brings the strongest claim back).
 
 Names are lowercase ASCII letters, digits and inner hyphens, 1 to 63 characters: no look-alike Unicode.
+
+### whoiam
+
+[whoiam](https://github.com/skandragon/freenet-whoiam) personas can vouch for a FreeNames key with whoiam's "sign in with whoiam" flow, as in [FreeTunes](https://github.com/scobru/freetunes): FreeNames sends a one-time challenge `<nonce>.<your key>`, whoiam signs it with the persona you pick, and FreeNames publishes the proof in your zone. The contract only checks your signature on it; whoever resolves your names verifies the proof and shows a "whoiam ✓" badge. No whoiam key or seed is ever shared. The signature format is checked against whoiam's golden vector (`ui/src/whoiam.test.ts`).
 
 ### Known limits
 
