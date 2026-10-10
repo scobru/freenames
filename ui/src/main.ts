@@ -1,7 +1,7 @@
 import "./style.css";
 import {
   claimName, finishSignIn, loadPetnames, loadRegistry, loadZone, officialWhoiam, personaName, pinNames, REGISTRY_ADMIN,
-  resolve, savePetnames, session, setRecord, signOut, startSignIn, webUrl, type Session,
+  resolve, savePetnames, search, session, setRecord, signOut, startSignIn, webUrl, type Session,
 } from "./lib";
 import { contractId, isKey, resolveOwner, ROOT, validName } from "./names";
 
@@ -40,21 +40,34 @@ function route() {
 function resolvePage(initial: string) {
   app.innerHTML = `
     <h1>Find a site by name</h1>
-    <p class="muted"><code>name</code> opens the site a name points to, <code>name/sub</code> one of its sub-names. Your petnames come first, then the public registry.</p>
-    <form id="f" class="row"><input id="q" placeholder="scobru/freetunes" autocomplete="off" spellcheck="false" value="${esc(initial)}" /><button class="primary">Resolve</button></form>
+    <p class="muted"><code>name</code> opens the site a name points to, <code>name/sub</code> one of its sub-names, and any part of a name finds every name that contains it. Your petnames come first, then the public registry.</p>
+    <form id="f" class="row"><input id="q" placeholder="scobru/freetunes" autocomplete="off" spellcheck="false" value="${esc(initial)}" /><button class="primary">Search</button></form>
     <div id="out"></div>`;
   const run = async (q: string) => {
     const out = $("#out");
-    out.innerHTML = `<p class="muted">Looking up…</p>`;
+    out.innerHTML = `<div id="exact"><p class="muted">Looking up…</p></div><div id="hits"></div>`;
+    const exact = $("#exact");
     try {
       const r = await resolve(q);
-      if (!r.owner) { out.innerHTML = `<p class="err">Nobody holds this name.</p>`; return; }
-      const who = `owner: whoiam persona <code title="${r.owner}">${esc(personaName(r.owner))}</code> (via ${r.via})`;
-      out.innerHTML = r.target
-        ? `<div class="card"><p><a class="btn primary" href="${webUrl(r.target)}" target="_blank" rel="noopener">Open ${esc(q)}</a></p>
-           <p class="muted"><small>${who} · contract <code>${esc(r.target)}</code></small></p></div>`
-        : `<p class="err">The owner has not set <code>${esc(r.sub)}</code>.</p><p class="muted"><small>${who}</small></p>`;
-    } catch (e) { out.innerHTML = `<p class="err">${esc(String((e as Error).message ?? e))}</p>`; }
+      const who = r.owner ? `owner: whoiam persona <code title="${r.owner}">${esc(personaName(r.owner))}</code> (via ${r.via})` : "";
+      exact.innerHTML = !r.owner ? `<p class="muted">No exact match for <code>${esc(q)}</code>.</p>`
+        : r.target
+          ? `<div class="card"><p><a class="btn primary" href="${webUrl(r.target)}" target="_blank" rel="noopener">Open ${esc(q)}</a></p>
+             <p class="muted"><small>${who} · contract <code>${esc(r.target)}</code></small></p></div>`
+          : `<p class="err">The owner has not set <code>${esc(r.sub)}</code>.</p><p class="muted"><small>${who}</small></p>`;
+    } catch { exact.innerHTML = ""; } // not a name (e.g. a partial word): the search below still runs
+    // partial matches: every known name containing the query
+    const hits = $("#hits"), needle = q.trim().toLowerCase().replace(/^fn:/, "");
+    const seen = new Set([needle]);
+    hits.innerHTML = `<h2>Names containing “${esc(needle)}”</h2><ul id="hl"></ul><p class="muted" id="hs">Searching…</p>`;
+    try {
+      await search(needle, (h) => {
+        if (seen.has(h.name)) return;
+        seen.add(h.name);
+        $("#hl").insertAdjacentHTML("beforeend", `<li><a href="${webUrl(h.target)}" target="_blank" rel="noopener"><code>${esc(h.name)}</code></a> <small class="muted">by ${esc(personaName(h.owner).slice(0, 10))}…</small></li>`);
+      });
+      $("#hs").textContent = seen.size > 1 ? "" : "None found.";
+    } catch (e) { $("#hs").textContent = String((e as Error).message ?? e); }
   };
   $("#f").onsubmit = (e) => {
     e.preventDefault();

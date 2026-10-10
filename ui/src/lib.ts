@@ -11,7 +11,7 @@ import {
   DelegateRequestType, DelegateType, InboundDelegateMsgT, InboundDelegateMsgType, RegisterDelegateT,
   RelatedContractsT, WasmDelegateV1T,
 } from "@freenetorg/freenet-stdlib/client-request";
-import { claimMsg, isKey, parseName, pinsMsg, resolveOwner, zoneMsg, type RegState, type Zone } from "./names";
+import { claimMsg, isKey, parseName, pinsMsg, resolveOwner, ROOT, zoneMsg, type RegState, type Zone } from "./names";
 import { verifyProof } from "./whoiam";
 export { personaName } from "./whoiam";
 import zoneWasm from "./zone.wasm?url";
@@ -373,6 +373,29 @@ export async function resolve(input: string): Promise<Resolution> {
   else [owner, via] = [resolveOwner(REGISTRY_ADMIN, await loadRegistry(), p.first), "registry"];
   const target = owner ? (await loadZone(owner))?.records[p.sub]?.target || null : null;
   return { owner, via, sub: p.sub, target };
+}
+
+export interface Hit { name: string; target: string; owner: string }
+const MAX_SEARCH_OWNERS = 100;
+
+/** Names containing `q` (lowercase): petnames and registry names, with their owners' sub-names. Hits arrive as zones load. */
+export async function search(q: string, onHit: (h: Hit) => void) {
+  const pets = await loadPetnames(), reg = await loadRegistry();
+  const labels = new Map<string, string>(); // label -> owner; petnames win, as in `resolve`
+  for (const n of [...Object.keys(reg.claims), ...Object.keys(reg.pins.map)]) {
+    const o = resolveOwner(REGISTRY_ADMIN, reg, n);
+    if (o) labels.set(n, o);
+  }
+  for (const [n, o] of Object.entries(pets)) labels.set(n, o);
+  const zones = new Map<string, Promise<Zone | null>>(); // one load per owner, even with several labels
+  // shortcut: only the first MAX_SEARCH_OWNERS labels are searched; add an index contract if the registry grows past that
+  for (const [label, owner] of [...labels].slice(0, MAX_SEARCH_OWNERS)) {
+    if (!zones.has(owner)) zones.set(owner, loadZone(owner).catch(() => null));
+    for (const [sub, r] of Object.entries((await zones.get(owner)!)?.records ?? {})) {
+      const name = sub === ROOT ? label : `${label}/${sub}`;
+      if (r.target && name.includes(q)) onHit({ name, target: r.target, owner });
+    }
+  }
 }
 
 /** Where the node serves a contract's web app (in dev the page is on Vite, the node elsewhere). */
