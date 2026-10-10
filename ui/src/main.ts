@@ -171,6 +171,9 @@ async function minePage() {
   });
 }
 
+// Inside the node's container the page is a sandboxed iframe: leaving it goes through the shell.
+const goTo = (href: string) => (window.parent !== window ? parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*") : void (location.href = href));
+
 /** Link a whoiam persona to your key: whoiam signs a proof, FreeNames never receives any secret. */
 function drawWhoiam(persona: string | null) {
   const card = $("#wc");
@@ -185,7 +188,7 @@ function drawWhoiam(persona: string | null) {
     <p class="muted">Show who stands behind your names: one of your <b>whoiam</b> personas signs that it knows this key. No key or seed is shared. whoiam opens, you pick a persona, you come back here.</p>
     <div class="row"><input id="wurl" value="${esc(officialWhoiam())}" spellcheck="false" autocomplete="off" /><button id="wgo" class="primary">Link a persona</button></div>
     <p id="wo"></p>`;
-  act("#wgo", "#wo", async () => { location.href = await startLink(val("#wurl")); return "Opening whoiam…"; });
+  act("#wgo", "#wo", async () => { goTo(await startLink(val("#wurl"))); return "Opening whoiam…"; });
 }
 
 /** whoiam sent the user back here with its proof (or a refusal). */
