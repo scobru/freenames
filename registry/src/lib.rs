@@ -1,15 +1,17 @@
-//! Registry: short global names. One shared instance; parameters = admin ed25519 pubkey (32 bytes).
-//! A claim binds a name to an owner key: it is signed by the owner and carries a proof-of-work. Several
+//! Registry: short global names. One shared instance; parameters = admin ed25519 pubkey (32 bytes)
+//! followed by the app's path (`/v1/contract/web/<app id>/`). A claim binds a name to an owner, a whoiam
+//! persona: it is signed by an app key the persona delegated (see `whoiam-delegation`), carries that
+//! delegation, and carries a proof-of-work. Several
 //! owners can claim the same name. The admin's signed pins decide when present (an empty owner reserves
 //! the name); otherwise the strongest proof (lowest hash) wins, so taking a name costs as much work as
 //! its holder spent, and the holder can always add more. The name then resolves to the owner's zone.
 //! Merging keeps, per name, the strongest claims of the strongest owners: a union under a total order,
 //! so every merge order converges. State is JSON.
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use whoiam_delegation::{check, key, verify, Cert, R};
 
 pub const POW_BITS: u32 = 18;
 pub const PER_NAME: usize = 3;
@@ -19,7 +21,8 @@ const MAX_PINS: usize = 10_000;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Claim {
     pub nonce: u64, // sha256(`<signed message>|<nonce>`) must start with POW_BITS zero bits
-    pub sig: String, // hex, by the owner over `fnc1|<admin>|<name>|<owner>`
+    pub sig: String, // hex, by the delegated app key over `fnc1|<admin>|<name>|<owner>`
+    pub cert: Cert,  // the owner's delegation to that key
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -49,23 +52,13 @@ pub struct Delta {
     pub pins: Option<Pins>,
 }
 
-type R<T> = Result<T, String>;
-
-// key, verify and valid_name are the same as in zone/src/lib.rs
-fn key(hexstr: &str) -> R<VerifyingKey> {
-    let b: [u8; 32] = hex::decode(hexstr)
-        .map_err(|e| e.to_string())?
-        .try_into()
-        .map_err(|_| "pubkey must be 32 bytes")?;
-    VerifyingKey::from_bytes(&b).map_err(|e| e.to_string())
+/// The registry's parameters: its admin key (hex) and the app whose delegations it accepts.
+pub struct Reg {
+    pub admin: String,
+    pub app: String,
 }
 
-fn verify(k: &VerifyingKey, msg: &[u8], sig_hex: &str) -> R<()> {
-    let sig = Signature::from_slice(&hex::decode(sig_hex).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    k.verify(msg, &sig).map_err(|_| "bad signature".to_string())
-}
-
+// same as in zone/src/lib.rs
 pub fn valid_name(n: &str) -> bool {
     (1..=63).contains(&n.len())
         && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -93,12 +86,13 @@ fn zero_bits(h: &[u8]) -> u32 {
     n
 }
 
-fn check_claim(admin: &str, name: &str, owner: &str, c: &Claim) -> R<()> {
+fn check_claim(r: &Reg, name: &str, owner: &str, c: &Claim) -> R<()> {
     if !valid_name(name) {
         return Err("bad name".into());
     }
-    verify(&key(owner)?, claim_msg(admin, name, owner).as_bytes(), &c.sig)?;
-    if zero_bits(&strength(admin, name, owner, c)) < POW_BITS {
+    let app_key = check(owner, &r.app, &c.cert)?;
+    verify(&app_key, claim_msg(&r.admin, name, owner).as_bytes(), &c.sig)?;
+    if zero_bits(&strength(&r.admin, name, owner, c)) < POW_BITS {
         return Err("insufficient proof of work".into());
     }
     Ok(())
@@ -141,15 +135,16 @@ fn prune(admin: &str, s: &mut RegState) {
     s.claims.retain(|_, m| !m.is_empty());
 }
 
-pub fn validate(admin: &str, s: &RegState) -> R<()> {
-    check_pins(admin, &s.pins)?;
+pub fn validate(r: &Reg, s: &RegState) -> R<()> {
+    check_pins(&r.admin, &s.pins)?;
     if s.claims.values().map(BTreeMap::len).sum::<usize>() > MAX_CLAIMS || s.claims.values().any(|m| m.len() > PER_NAME) {
         return Err("state out of bounds".into());
     }
-    s.claims.iter().try_for_each(|(n, m)| m.iter().try_for_each(|(o, c)| check_claim(admin, n, o, c)))
+    s.claims.iter().try_for_each(|(n, m)| m.iter().try_for_each(|(o, c)| check_claim(r, n, o, c)))
 }
 
-pub fn apply(admin: &str, s: &mut RegState, d: Delta) -> R<()> {
+pub fn apply(r: &Reg, s: &mut RegState, d: Delta) -> R<()> {
+    let admin = r.admin.as_str();
     if let Some(p) = d.pins {
         if p.ts > s.pins.ts {
             check_pins(admin, &p)?;
@@ -162,7 +157,7 @@ pub fn apply(admin: &str, s: &mut RegState, d: Delta) -> R<()> {
             if have.is_some_and(|h| strength(admin, &name, &owner, h) <= strength(admin, &name, &owner, &c)) {
                 continue; // not stronger than what we hold for this owner
             }
-            check_claim(admin, &name, &owner, &c)?;
+            check_claim(r, &name, &owner, &c)?;
             s.claims.entry(name.clone()).or_default().insert(owner, c);
         }
     }
@@ -204,8 +199,11 @@ pub fn delta(s: &RegState, sum: &Summary) -> Delta {
 
 // ---- Freenet glue ----
 
-fn admin(p: &Parameters) -> String {
-    hex::encode(p.as_ref())
+fn reg(p: &Parameters) -> Result<Reg, ContractError> {
+    let b = p.as_ref();
+    let bad = || ContractError::Deser("parameters: admin key (32 bytes) then app path".into());
+    let app = std::str::from_utf8(b.get(32..).ok_or_else(bad)?).map_err(|_| bad())?;
+    Ok(Reg { admin: hex::encode(&b[..32]), app: app.into() })
 }
 
 fn de<T: for<'a> Deserialize<'a>>(b: &[u8]) -> Result<T, ContractError> {
@@ -231,7 +229,7 @@ impl ContractInterface for Contract {
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
         let s: RegState = de_or_default(state.as_ref())?;
-        Ok(match validate(&admin(&parameters), &s) {
+        Ok(match validate(&reg(&parameters)?, &s) {
             Ok(()) => ValidateResult::Valid,
             Err(_) => ValidateResult::Invalid,
         })
@@ -242,7 +240,7 @@ impl ContractInterface for Contract {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        let admin = admin(&parameters);
+        let reg = reg(&parameters)?;
         let mut s: RegState = de_or_default(state.as_ref())?;
         for u in data {
             let d: Delta = match u {
@@ -254,7 +252,7 @@ impl ContractInterface for Contract {
                 UpdateData::StateAndDelta { delta, .. } => de(delta.as_ref())?,
                 _ => return Err(ContractError::InvalidUpdate),
             };
-            apply(&admin, &mut s, d).map_err(|_| ContractError::InvalidUpdate)?;
+            apply(&reg, &mut s, d).map_err(|_| ContractError::InvalidUpdate)?;
         }
         Ok(UpdateModification::valid(State::from(ser(&s)?)))
     }
@@ -279,6 +277,21 @@ impl ContractInterface for Contract {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use whoiam_delegation::connect_message;
+
+    const APP: &str = "/v1/contract/web/App1/";
+    fn reg_of(admin: &str) -> Reg {
+        Reg { admin: admin.into(), app: APP.into() }
+    }
+    /// `persona` delegates the app key `app_key` for this app.
+    fn cert(persona: &SigningKey, app_key: &SigningKey) -> Cert {
+        let (base, challenge) = (format!("http://127.0.0.1:7509{APP}"), format!("wd1.{}.n1", pk(app_key)));
+        let sig = persona.sign(&connect_message(persona.verifying_key().as_bytes(), &base, &challenge, 1));
+        Cert { base, challenge, ts: 1, sig: hex::encode(sig.to_bytes()) }
+    }
+    fn blank(nonce: u64) -> Claim {
+        Claim { nonce, sig: String::new(), cert: Cert { base: String::new(), challenge: String::new(), ts: 0, sig: String::new() } }
+    }
 
     fn sk(n: u8) -> SigningKey {
         SigningKey::from_bytes(&[n; 32])
@@ -287,13 +300,13 @@ mod tests {
         hex::encode(k.verifying_key().to_bytes())
     }
 
-    /// A valid claim, mining from `start` (about 2^18 hashes). Different starts give different strengths.
+    /// A valid claim by persona `k`, written with a delegated app key, mining from `start` (about 2^18 hashes).
     fn claim(admin: &str, name: &str, k: &SigningKey, start: u64) -> Delta {
-        let o = pk(k);
+        let (o, app_key) = (pk(k), sk(200));
         let msg = claim_msg(admin, name, &o);
-        let sig = hex::encode(k.sign(msg.as_bytes()).to_bytes());
-        let nonce = (start..).find(|&n| zero_bits(&strength(admin, name, &o, &Claim { nonce: n, sig: String::new() })) >= POW_BITS).unwrap();
-        Delta { claims: [(name.into(), [(o, Claim { nonce, sig })].into())].into(), pins: None }
+        let sig = hex::encode(app_key.sign(msg.as_bytes()).to_bytes());
+        let nonce = (start..).find(|&n| zero_bits(&strength(admin, name, &o, &blank(n))) >= POW_BITS).unwrap();
+        Delta { claims: [(name.into(), [(o, Claim { nonce, sig, cert: cert(k, &app_key) })].into())].into(), pins: None }
     }
 
     fn pins(admin: &SigningKey, ts: u64, map: &[(&str, &str)]) -> Delta {
@@ -305,7 +318,7 @@ mod tests {
     #[test]
     fn strength_vector_shared_with_ui() {
         let (a, o) = ("aa".repeat(32), "bb".repeat(32)); // same vector as ui/src/names.test.ts
-        let h = strength(&a, "x", &o, &Claim { nonce: 7, sig: String::new() });
+        let h = strength(&a, "x", &o, &blank(7));
         assert_eq!(hex::encode(h), "d62d6f096a13690dea0ee38885ab0645ff8b124129f1958a15075ecf78ff3125");
     }
 
@@ -314,12 +327,12 @@ mod tests {
         let a = pk(&sk(1));
         let (c2, c3) = (claim(&a, "music", &sk(2), 0), claim(&a, "music", &sk(3), 0));
         let (mut s1, mut s2) = (RegState::default(), RegState::default());
-        apply(&a, &mut s1, c2.clone()).unwrap();
-        apply(&a, &mut s1, c3.clone()).unwrap();
-        apply(&a, &mut s2, c3).unwrap();
-        apply(&a, &mut s2, c2).unwrap();
+        apply(&reg_of(&a), &mut s1, c2.clone()).unwrap();
+        apply(&reg_of(&a), &mut s1, c3.clone()).unwrap();
+        apply(&reg_of(&a), &mut s2, c3).unwrap();
+        apply(&reg_of(&a), &mut s2, c2).unwrap();
         assert_eq!(s1, s2);
-        validate(&a, &s1).unwrap();
+        validate(&reg_of(&a), &s1).unwrap();
         let m = &s1.claims["music"];
         let best = m.iter().min_by_key(|(o, c)| strength(&a, "music", o, c)).unwrap().0;
         assert_eq!(resolve(&a, &s1, "music"), Some(best.as_str()));
@@ -338,15 +351,19 @@ mod tests {
         let mut forged = good.clone();
         let c = forged.claims.get_mut("site").unwrap().remove(&pk(&sk(2))).unwrap();
         forged.claims.get_mut("site").unwrap().insert(pk(&sk(3)), c);
-        assert!(apply(&a, &mut s, forged).is_err());
+        assert!(apply(&reg_of(&a), &mut s, forged).is_err());
         // bound to this registry: the same claim does not hold under another admin
-        assert!(apply(&pk(&sk(9)), &mut RegState::default(), good.clone()).is_err());
+        assert!(apply(&reg_of(&pk(&sk(9))), &mut RegState::default(), good.clone()).is_err());
         let mut lazy = good.clone();
         lazy.claims.get_mut("site").unwrap().values_mut().for_each(|c| c.nonce += 1); // fails the difficulty with p = 1 - 2^-18
-        assert!(apply(&a, &mut s, lazy).is_err());
-        assert!(apply(&a, &mut s, claim(&a, "Bad", &sk(2), 0)).is_err());
-        apply(&a, &mut s, good).unwrap();
-        validate(&a, &s).unwrap();
+        assert!(apply(&reg_of(&a), &mut s, lazy).is_err());
+        assert!(apply(&reg_of(&a), &mut s, claim(&a, "Bad", &sk(2), 0)).is_err());
+        // delegated for another app
+        let mut other_app = good.clone();
+        other_app.claims.get_mut("site").unwrap().values_mut().for_each(|c| c.cert.base = "http://h/v1/contract/web/App2/".into());
+        assert!(apply(&reg_of(&a), &mut s, other_app).is_err());
+        apply(&reg_of(&a), &mut s, good).unwrap();
+        validate(&reg_of(&a), &s).unwrap();
     }
 
     #[test]
@@ -354,17 +371,17 @@ mod tests {
         let admin = sk(1);
         let a = pk(&admin);
         let mut s = RegState::default();
-        apply(&a, &mut s, claim(&a, "music", &sk(2), 0)).unwrap();
+        apply(&reg_of(&a), &mut s, claim(&a, "music", &sk(2), 0)).unwrap();
         // pinned to an owner with no claim at all: the pin still wins
-        apply(&a, &mut s, pins(&admin, 1, &[("music", &pk(&sk(4))), ("admin", "")])).unwrap();
+        apply(&reg_of(&a), &mut s, pins(&admin, 1, &[("music", &pk(&sk(4))), ("admin", "")])).unwrap();
         assert_eq!(resolve(&a, &s, "music"), Some(pk(&sk(4)).as_str()));
         assert_eq!(resolve(&a, &s, "admin"), None);
         // only the admin pins, and older pins never come back
-        assert!(apply(&a, &mut s, pins(&sk(9), 2, &[])).is_err());
-        apply(&a, &mut s, pins(&admin, 3, &[])).unwrap();
-        apply(&a, &mut s, pins(&admin, 1, &[("music", "")])).unwrap();
+        assert!(apply(&reg_of(&a), &mut s, pins(&sk(9), 2, &[])).is_err());
+        apply(&reg_of(&a), &mut s, pins(&admin, 3, &[])).unwrap();
+        apply(&reg_of(&a), &mut s, pins(&admin, 1, &[("music", "")])).unwrap();
         assert_eq!(resolve(&a, &s, "music"), Some(pk(&sk(2)).as_str()));
-        validate(&a, &s).unwrap();
+        validate(&reg_of(&a), &s).unwrap();
     }
 
     #[test]
@@ -372,7 +389,7 @@ mod tests {
         let a = pk(&sk(1));
         let mut s = RegState::default();
         for i in 2..=6 {
-            apply(&a, &mut s, claim(&a, "x", &sk(i), 0)).unwrap();
+            apply(&reg_of(&a), &mut s, claim(&a, "x", &sk(i), 0)).unwrap();
         }
         assert_eq!(s.claims["x"].len(), PER_NAME);
         let mut kept: Vec<_> = s.claims["x"].iter().map(|(o, c)| strength(&a, "x", o, c)).collect();
@@ -380,6 +397,6 @@ mod tests {
         let worst_kept = kept[PER_NAME - 1];
         let all_strengths: Vec<_> = (2..=6).map(|i| claim(&a, "x", &sk(i), 0)).flat_map(|d| d.claims["x"].clone()).map(|(o, c)| strength(&a, "x", &o, &c)).collect();
         assert_eq!(all_strengths.iter().filter(|h| **h <= worst_kept).count(), PER_NAME);
-        validate(&a, &s).unwrap();
+        validate(&reg_of(&a), &s).unwrap();
     }
 }

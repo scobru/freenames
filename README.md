@@ -10,19 +10,34 @@ A name system can be at most two of **global**, **secure** and **human-readable*
 
 | Layer | Form | Secure? | Global? |
 | --- | --- | --- | --- |
-| **Zone** | `<key>/name` | yes: only the key's owner writes it | yes, but not readable |
+| **Zone** | `<persona key>/name` | yes: only the persona authorizes writes | yes, but not readable |
 | **Petname** | `alice/name` (your own label for a key) | yes | no: local to your node |
 | **Registry** | `alice/name` (a short public name) | as far as the rules below go | yes |
 
-Resolution: `first/sub` → `first` is a 64-hex key, else your petname, else the registry → the owner's zone → record `sub` (or `@`, the zone root, when there is no `/sub`) → contract id → `http://<node>/v1/contract/web/<id>/`.
+Your identity is your [whoiam](https://github.com/skandragon/freenet-whoiam) persona (see *Identity* below).
+
+Resolution: `first/sub` → `first` is a 64-hex persona key, else your petname, else the registry → the owner's zone → record `sub` (or `@`, the zone root, when there is no `/sub`) → contract id → `http://<node>/v1/contract/web/<id>/`.
 
 ## Design
 
-| Contract | What it holds | Address |
+| Part | What it holds | Address |
 | --- | --- | --- |
-| **Zone** (`zone/`) | The names one key publishes: name → contract id, each record signed by the owner (`fnz1\|<owner>\|<name>\|<target>\|<ts>`). Newest record per name wins; an empty target is a tombstone. Up to 1000 records. Optionally a whoiam proof, signed by the owner (`fnw1\|<owner>\|<proof>\|<ts>`). | parameters = owner public key, so anyone who knows the key finds the zone |
-| **Registry** (`registry/`) | Claims: name → owner key, signed by the owner (`fnc1\|<admin>\|<name>\|<owner>`) with an 18-bit sha256 proof-of-work. Admin-signed pins (`fnp1\|<ts>\|name=owner,...`). | one shared instance (its parameter is the admin public key) |
-| **Identity delegate** (`identity/`) | Your signing key and a small store (petnames). Same delegate as FreeTunes. | one per calling web app |
+| **Delegation** (`delegation/`) | Plain Rust library, no Freenet dependency: checks a whoiam delegation and returns the app key it authorizes. | — |
+| **Zone** (`zone/`) | The names one persona publishes: name → contract id. Each record is signed by a delegated app key (`fnz2\|<persona>\|<name>\|<target>\|<ts>`) and carries its delegation. Newest record per name wins; an empty target is a tombstone. Up to 1000 records. | parameters = persona public key + app path |
+| **Registry** (`registry/`) | Claims: name → persona, signed by a delegated app key (`fnc1\|<admin>\|<name>\|<persona>`), with its delegation and an 18-bit sha256 proof-of-work. Admin-signed pins (`fnp1\|<ts>\|name=persona,...`). | one shared instance (parameters = admin public key + app path) |
+| **Identity delegate** (`identity/`) | The node's app key (disposable) and a small store (session, petnames). | one per calling web app |
+
+### Identity: whoiam delegation
+
+There is no FreeNames account and no key to back up. You sign in with whoiam once per node:
+
+1. The node keeps a random **app key**. FreeNames opens whoiam's "sign in" flow with the challenge `wd1.<app key>.<nonce>`.
+2. whoiam signs, with the persona you pick, `"whoiam-connect-v1" ‖ persona ‖ len ‖ return_base ‖ len ‖ challenge ‖ ts`. `return_base` is FreeNames' own address, so the signature means: *this app key may write for me in FreeNames*. That signature is the **delegation**.
+3. Every write is signed by the app key and carries the delegation. The contracts check both, and that the delegation's path is the one in their parameters (`/v1/contract/web/<FreeNames id>/`), so a delegation made for another app is useless here.
+
+The owner of zones and claims is the **persona**. A new node or a lost one is just another sign-in. The signature format is checked against whoiam's golden vector (`delegation/src/lib.rs`, `ui/src/whoiam.test.ts`).
+
+This uses whoiam's connect flow for something it does not advertise: whoiam shows "sign in to <origin>", not "authorize this key". When whoiam ships its own cross-app delegation, FreeNames should switch to it.
 
 ### Who owns a registry name
 
@@ -33,16 +48,13 @@ The contract keeps the 3 strongest owners per name and the 5000 strongest claims
 
 Names are lowercase ASCII letters, digits and inner hyphens, 1 to 63 characters: no look-alike Unicode.
 
-### whoiam
-
-[whoiam](https://github.com/skandragon/freenet-whoiam) personas can vouch for a FreeNames key with whoiam's "sign in with whoiam" flow, as in [FreeTunes](https://github.com/scobru/freetunes): FreeNames sends a one-time challenge `<nonce>.<your key>`, whoiam signs it with the persona you pick, and FreeNames publishes the proof in your zone. The contract only checks your signature on it; whoever resolves your names verifies the proof and shows a "whoiam ✓" badge. No whoiam key or seed is ever shared. The signature format is checked against whoiam's golden vector (`ui/src/whoiam.test.ts`).
-
 ### Known limits
 
 - **The registry is only as fair as proof-of-work.** Someone with more CPU can take an unpinned name. Pins fix that, but they make the admin a central authority for pinned names. Use zones or petnames when that matters.
 - Zones and the registry are ordinary contracts: nodes drop contracts nobody asks for. A name stays reachable while someone keeps it hosted.
-- Losing your key means losing your zone and your claims. Export it (My names → Show secret key).
-- Not yet: delegation through other people's petnames (`ivvor.kate`), name expiry, anchoring claims to Bitcoin for admin-free global names.
+- Delegations do not expire and cannot be revoked yet (contracts have no clock): whoever controls a node you signed in from can keep writing for your persona in FreeNames.
+- In `npm run dev` the app path is `/`, so dev zones and the dev registry are separate from the published ones, and whoiam sign-in only works on the published site (it must be on the same node).
+- Not yet: revoking a delegation, delegation through other people's petnames (`ivvor.kate`), name expiry, anchoring claims to Bitcoin for admin-free global names.
 - Untested against a live node. The contracts are covered by `cargo test`; the UI is type-checked, its name logic is unit-tested, and the resolve page was checked in a browser without a node.
 
 ## Development

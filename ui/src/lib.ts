@@ -11,8 +11,8 @@ import {
   DelegateRequestType, DelegateType, InboundDelegateMsgT, InboundDelegateMsgType, RegisterDelegateT,
   RelatedContractsT, WasmDelegateV1T,
 } from "@freenetorg/freenet-stdlib/client-request";
-import { claimMsg, isKey, parseName, personaMsg, pinsMsg, resolveOwner, zoneMsg, type RegState, type Zone } from "./names";
-import { verifyProof, type Proof } from "./whoiam";
+import { claimMsg, isKey, parseName, pinsMsg, resolveOwner, zoneMsg, type RegState, type Zone } from "./names";
+import { verifyProof } from "./whoiam";
 export { personaName } from "./whoiam";
 import zoneWasm from "./zone.wasm?url";
 import registryWasm from "./registry.wasm?url";
@@ -118,7 +118,6 @@ async function sendDelta(instance: string, delta: object) {
 // ---------------------------------------------------------------- identity delegate
 // The signing key lives in the node (one per calling web app), so it survives sessions even inside the sandboxed
 // container where the page has no storage. If the delegate is missing or silent, fall back to localStorage, then memory.
-export interface Identity { pk: string; persisted: boolean; sign: (msg: string) => Promise<string> }
 
 let delegateKey: DelegateKeyT | undefined;
 let delegateChain: Promise<unknown> = Promise.resolve();
@@ -188,74 +187,34 @@ const hasDelegate = () =>
     return false;
   }));
 
-/** Where the signing key lives. Creating an identity is always an explicit step: nothing here makes one by itself. */
+/** Where the app key lives. It is disposable: whoiam delegates it, and a lost one is replaced by signing in again. */
 interface KeyStore {
-  persisted: boolean;
-  pk(): Promise<string | null>; // null when there is no identity yet
+  pk(): Promise<string | null>;
   create(sk: string): Promise<string>; // keeps the existing one, if any
-  replace(sk: string): Promise<string>;
-  exportSk(): Promise<string>;
   sign(msg: string): Promise<string>;
 }
 
 const delegateStore: KeyStore = {
-  persisted: true,
   pk: async () => {
     try { return (await callDelegate({ op: "pubkey" })).pk as string; }
     catch (e) { if (/no identity/.test(String(e))) return null; throw e; }
   },
   create: async (sk) => (await callDelegate({ op: "init", sk })).pk,
-  replace: async (sk) => (await callDelegate({ op: "replace", sk })).pk,
-  exportSk: async () => (await callDelegate({ op: "export" })).sk,
   sign: async (msg) => (await callDelegate({ op: "sign", msg })).sig,
 };
 
 let memKey: string | null = null;
-let lsWorks = true;
-const readKey = () => { try { return localStorage.getItem("fn-sk"); } catch { lsWorks = false; return memKey; } };
-const writeKey = (h: string) => { memKey = h; try { localStorage.setItem("fn-sk", h); } catch { lsWorks = false; } };
+const readKey = () => { try { return localStorage.getItem("fn-sk"); } catch { return memKey; } };
+const writeKey = (h: string) => { memKey = h; try { localStorage.setItem("fn-sk", h); } catch { /* sandbox: memory only */ } };
 const localStore: KeyStore = {
-  get persisted() { return lsWorks; },
   pk: async () => { const h = readKey(); return h ? hex(await ed.getPublicKeyAsync(unhex(h))) : null; },
   create: async (sk) => { if (!readKey()) writeKey(sk); return hex(await ed.getPublicKeyAsync(unhex(readKey()!))); },
-  replace: async (sk) => { writeKey(sk); return hex(await ed.getPublicKeyAsync(unhex(sk))); },
-  exportSk: async () => { const h = readKey(); if (!h) throw new Error("no identity"); return h; },
   sign: async (msg) => hex(await ed.signAsync(enc.encode(msg), unhex(readKey()!))),
 };
 
 const keyStore = async () => ((await hasDelegate()) ? delegateStore : localStore);
-const asIdentity = (s: KeyStore, pk: string): Identity => ({ pk, persisted: s.persisted, sign: (m) => s.sign(m) });
-const newSecret = () => hex(ed.utils.randomPrivateKey());
-
-/** The identity, if one exists. Never creates one: listeners and visitors do not need a key. */
-export async function peekIdentity(): Promise<Identity | null> {
-  const s = await keyStore(), pk = await s.pk();
-  return pk ? asIdentity(s, pk) : null;
-}
-
-/** The identity, or an error telling the user to create one. For everything that signs. */
-export async function requireIdentity(): Promise<Identity> {
-  const me = await peekIdentity();
-  if (!me) throw new Error("Create an identity first (Identity in the menu).");
-  return me;
-}
-
-/** Create an identity with a fresh key. If one exists already it is kept. */
-export async function createIdentity(): Promise<Identity> {
-  const s = await keyStore();
-  return asIdentity(s, await s.create(newSecret()));
-}
-
-
-/** Replace the identity with `sk` (hex): for restoring a backup. The old key is gone unless it was exported. */
-export async function replaceIdentity(sk: string): Promise<Identity> {
-  if (!/^[0-9a-f]{64}$/.test(sk)) throw new Error("A secret key is 64 hex characters.");
-  const s = await keyStore();
-  return asIdentity(s, await s.replace(sk));
-}
-
-/** The secret key, for a backup the user asked for. */
-export const exportSecret = async () => (await keyStore()).exportSk();
+/** The app key (hex), created on first use. */
+const appKey = async () => { const s = await keyStore(); return (await s.pk()) ?? s.create(hex(ed.utils.randomPrivateKey())); };
 
 // small per-app store (petnames): the delegate when available, else localStorage, else memory
 const mem = new Map<string, string>();
@@ -287,9 +246,69 @@ async function mine(msg: string, bits: number): Promise<number> {
 }
 
 
+// The app's own path: delegations and contract parameters are bound to it (in dev, "/").
+const APP_PATH = location.pathname;
+const withApp = (keyHex: string) => new Uint8Array([...unhex(keyHex), ...enc.encode(APP_PATH)]);
+
+// ---------------------------------------------------------------- session: a whoiam persona and its delegation
+// whoiam signs `wd1.<app key>.<nonce>` for this app's address: "this app key acts for me here"
+// (see delegation/src/lib.rs). The persona is the identity; the app key only signs on its behalf.
+export interface Cert { base: string; challenge: string; ts: number; sig: string }
+export interface Session { persona: string; cert: Cert; sign: (msg: string) => Promise<string> }
+
+/** The signed-in persona, if its delegation still holds for this node's app key. */
+export async function session(): Promise<Session | null> {
+  const raw = await storeGet("session");
+  if (!raw) return null;
+  const { persona, cert } = JSON.parse(raw) as { persona: string; cert: Cert };
+  const s = await keyStore(), k = await s.pk();
+  if (!k || cert.challenge.split(".")[1] !== k) return null; // the app key changed: sign in again
+  return { persona, cert, sign: (m) => s.sign(m) };
+}
+
+async function requireSession(): Promise<Session> {
+  const s = await session();
+  if (!s) throw new Error("Sign in with whoiam first (My names).");
+  return s;
+}
+
+export const signOut = () => storePut("session", "");
+
+/** The official whoiam web contract; any other whoiam site on this node can be used instead. */
+export const WHOIAM_KEY = "87upyDfYzYHVY1Ypu9knhGUGRdydz54FHrBB6Bp2VBTg";
+export const officialWhoiam = () => `${location.protocol}//${location.host}/v1/contract/web/${WHOIAM_KEY}/`;
+const LINK_MAX_AGE_MS = 10 * 60 * 1000;
+/** Our own address without query or hash: whoiam binds its proof to it. */
+const linkBase = () => `${location.protocol}//${location.host}${APP_PATH}`;
+
+/** Where to send the user to sign in. Remembers the one-time challenge in the delegate store. */
+export async function startSignIn(whoiamUrl: string): Promise<string> {
+  const u = new URL(whoiamUrl);
+  if (u.host !== location.host || !/^\/v[12]\/contract\/web\/[^/]+\/?$/.test(u.pathname)) {
+    throw new Error("Paste the address of your whoiam site on this node (it starts with the same host as this page).");
+  }
+  const challenge = `wd1.${await appKey()}.${hex(crypto.getRandomValues(new Uint8Array(16)))}`;
+  await storePut("signin-pending", challenge);
+  return `${u.origin}${u.pathname}?connect=v1&challenge=${challenge}&return=${encodeURIComponent(linkBase())}`;
+}
+
+/** Handle whoiam's callback: check challenge, freshness and signature, then keep the delegation. */
+export async function finishSignIn(q: URLSearchParams): Promise<string> {
+  if (q.get("whoiam") === "denied") throw new Error("You chose not to share a persona.");
+  const pending = await storeGet("signin-pending");
+  await storePut("signin-pending", ""); // one use: burn it whatever happens next
+  const persona = q.get("pk") ?? "";
+  const cert: Cert = { base: linkBase(), challenge: q.get("challenge") ?? "", ts: Number(q.get("ts")), sig: q.get("sig") ?? "" };
+  if (!pending || cert.challenge !== pending) throw new Error("This sign-in is unknown or was already used. Start again from My names.");
+  if (!Number.isFinite(cert.ts) || Math.abs(Date.now() - cert.ts) > LINK_MAX_AGE_MS) throw new Error("The proof is too old or its clock is off. Start again.");
+  if (!(await verifyProof({ ...cert, pk: persona }))) throw new Error("whoiam's signature does not verify.");
+  await storePut("session", JSON.stringify({ persona, cert }));
+  return persona;
+}
+
 // ---------------------------------------------------------------- registry (see registry/src/lib.rs)
 let regId: Promise<string> | undefined;
-const registryId = () => (regId ??= keyOf(registryWasm, unhex(REGISTRY_ADMIN)).then((k) => k.encode()));
+const registryId = () => (regId ??= keyOf(registryWasm, withApp(REGISTRY_ADMIN)).then((k) => k.encode()));
 const EMPTY_REG: RegState = { claims: {}, pins: { ts: 0, map: {}, sig: "" } };
 
 /** Load the registry. The first visitor on a node creates it (empty). */
@@ -297,21 +316,21 @@ export async function loadRegistry(): Promise<RegState> {
   const id = await registryId();
   try { return await getJson<RegState>(id); }
   catch {
-    await putContract(registryWasm, unhex(REGISTRY_ADMIN), enc.encode(JSON.stringify(EMPTY_REG)));
+    await putContract(registryWasm, withApp(REGISTRY_ADMIN), enc.encode(JSON.stringify(EMPTY_REG)));
     return getJson<RegState>(id);
   }
 }
 
-/** Claim a short name for your key: sign it and mine the proof-of-work (a few seconds). */
+/** Claim a short name for your persona: sign it and mine the proof-of-work (a few seconds). */
 export async function claimName(name: string) {
-  const me = await requireIdentity();
-  const msg = claimMsg(REGISTRY_ADMIN, name, me.pk);
+  const me = await requireSession();
+  const msg = claimMsg(REGISTRY_ADMIN, name, me.persona);
   const sig = await me.sign(msg), nonce = await mine(msg, POW_BITS);
   await loadRegistry(); // makes sure it exists and caches its full key for the update
-  await sendDelta(await registryId(), { claims: { [name]: { [me.pk]: { nonce, sig } } } });
+  await sendDelta(await registryId(), { claims: { [name]: { [me.persona]: { nonce, sig, cert: me.cert } } } });
 }
 
-/** Admin only: replace the pins (name -> owner key, "" reserves the name). */
+/** Admin only: replace the pins (name -> persona key, "" reserves the name). */
 export async function pinNames(adminSecretHex: string, map: Record<string, string>) {
   const ts = Date.now();
   const sig = hex(await ed.signAsync(enc.encode(pinsMsg({ ts, map })), unhex(adminSecretHex)));
@@ -320,100 +339,42 @@ export async function pinNames(adminSecretHex: string, map: Record<string, strin
 }
 
 // ---------------------------------------------------------------- zones (see zone/src/lib.rs)
-const zoneId = (pk: string) => keyOf(zoneWasm, unhex(pk)).then((k) => k.encode());
+const zoneId = (persona: string) => keyOf(zoneWasm, withApp(persona)).then((k) => k.encode());
 
-/** A key's zone, or null if the node cannot find one (a missing contract can also just time out). */
-export async function loadZone(pk: string): Promise<Zone | null> {
-  try { return await getJson<Zone>(await zoneId(pk)); }
+/** A persona's zone, or null if the node cannot find one (a missing contract can also just time out). */
+export async function loadZone(persona: string): Promise<Zone | null> {
+  try { return await getJson<Zone>(await zoneId(persona)); }
   catch (e) { if (/not found|timeout/i.test(String(e))) return null; throw e; }
 }
 
 /** Point one of your names at a contract (empty target removes it). The first record creates your zone. */
 export async function setRecord(name: string, target: string) {
-  const me = await requireIdentity();
-  const ts = Date.now(), rec = { target, ts, sig: await me.sign(zoneMsg(me.pk, name, target, ts)) };
+  const me = await requireSession();
+  const ts = Date.now(), rec = { target, ts, sig: await me.sign(zoneMsg(me.persona, name, target, ts)), cert: me.cert };
   const records = { [name]: rec };
-  if (await loadZone(me.pk)) await sendDelta(await zoneId(me.pk), { records });
-  else await putContract(zoneWasm, unhex(me.pk), enc.encode(JSON.stringify({ records })));
+  if (await loadZone(me.persona)) await sendDelta(await zoneId(me.persona), { records });
+  else await putContract(zoneWasm, withApp(me.persona), enc.encode(JSON.stringify({ records })));
 }
 
 // ---------------------------------------------------------------- petnames and resolution
-export const loadPetnames = async (): Promise<Record<string, string>> => JSON.parse((await storeGet("petnames")) ?? "{}");
+export const loadPetnames = async (): Promise<Record<string, string>> => JSON.parse((await storeGet("petnames")) || "{}");
 export const savePetnames = (p: Record<string, string>) => storePut("petnames", JSON.stringify(p));
 
-export interface Resolution {
-  owner: string | null; via: "key" | "petname" | "registry"; sub: string; target: string | null;
-  persona: string | null; // whoiam persona key (hex) vouching for the owner, if its proof holds
-}
+export interface Resolution { owner: string | null; via: "key" | "petname" | "registry"; sub: string; target: string | null }
 
 /** `name[/sub]`: your petnames first, then the registry; then the owner's zone. */
 export async function resolve(input: string): Promise<Resolution> {
   const p = parseName(input);
-  if (!p) throw new Error("Not a name: use name, name/sub or a 64-hex key.");
+  if (!p) throw new Error("Not a name: use name, name/sub or a 64-hex persona key.");
   let owner: string | null, via: Resolution["via"];
   const pets = await loadPetnames();
   if (isKey(p.first)) [owner, via] = [p.first, "key"];
   else if (pets[p.first]) [owner, via] = [pets[p.first], "petname"];
   else [owner, via] = [resolveOwner(REGISTRY_ADMIN, await loadRegistry(), p.first), "registry"];
-  const zone = owner ? await loadZone(owner) : null;
-  return { owner, via, sub: p.sub, target: zone?.records[p.sub]?.target || null, persona: owner ? await zonePersona(zone, owner) : null };
+  const target = owner ? (await loadZone(owner))?.records[p.sub]?.target || null : null;
+  return { owner, via, sub: p.sub, target };
 }
 
 /** Where the node serves a contract's web app (in dev the page is on Vite, the node elsewhere). */
 export const webUrl = (id: string) =>
   `${import.meta.env.DEV ? `http://${import.meta.env.VITE_NODE ?? "127.0.0.1:7509"}` : `${location.protocol}//${location.host}`}/v1/contract/web/${id}/`;
-
-// ---------------------------------------------------------------- whoiam ("sign in with whoiam", as in FreeTunes)
-// A persona signs a one-time challenge that contains our key; the proof is published in our zone and every
-// viewer checks it. FreeNames never receives a whoiam secret.
-const verifyLink = async (l: Proof, pk: string) => l.challenge.endsWith(`.${pk}`) && (await verifyProof(l));
-
-/** The official whoiam web contract; any other whoiam site on this node can be used instead. */
-export const WHOIAM_KEY = "87upyDfYzYHVY1Ypu9knhGUGRdydz54FHrBB6Bp2VBTg";
-export const officialWhoiam = () => `${location.protocol}//${location.host}/v1/contract/web/${WHOIAM_KEY}/`;
-const LINK_MAX_AGE_MS = 10 * 60 * 1000;
-/** Our own address without query or hash: whoiam binds its proof to it. */
-const linkBase = () => `${location.protocol}//${location.host}${location.pathname}`;
-
-/** Where to send the user to pick a persona. Remembers the one-time challenge in the delegate store. */
-export async function startLink(whoiamUrl: string): Promise<string> {
-  const me = await requireIdentity();
-  const u = new URL(whoiamUrl);
-  if (u.host !== location.host || !/^\/v[12]\/contract\/web\/[^/]+\/?$/.test(u.pathname)) {
-    throw new Error("Paste the address of your whoiam site on this node (it starts with the same host as this page).");
-  }
-  const challenge = `${hex(crypto.getRandomValues(new Uint8Array(16)))}.${me.pk}`;
-  await storePut("link-pending", JSON.stringify({ challenge, base: linkBase() }));
-  return `${u.origin}${u.pathname}?connect=v1&challenge=${challenge}&return=${encodeURIComponent(linkBase())}`;
-}
-
-/** Handle whoiam's callback: check challenge, freshness and signature, then publish the proof in our zone. */
-export async function finishLink(q: URLSearchParams): Promise<string> {
-  if (q.get("whoiam") === "denied") throw new Error("You chose not to share a persona.");
-  const pending = JSON.parse((await storeGet("link-pending")) || "null") as { challenge: string; base: string } | null;
-  await storePut("link-pending", ""); // one use: burn it whatever happens next
-  const l: Proof = { pk: q.get("pk") ?? "", sig: q.get("sig") ?? "", challenge: q.get("challenge") ?? "", ts: Number(q.get("ts")), base: pending?.base ?? "" };
-  if (!pending || l.challenge !== pending.challenge) throw new Error("This link request is unknown or was already used. Start again from My names.");
-  if (!Number.isFinite(l.ts) || Math.abs(Date.now() - l.ts) > LINK_MAX_AGE_MS) throw new Error("The proof is too old or its clock is off. Start again.");
-  const me = await requireIdentity();
-  if (!(await verifyLink(l, me.pk))) throw new Error("The proof does not verify for your key.");
-  await publishPersona(JSON.stringify(l));
-  return l.pk;
-}
-
-/** Publish (or, with "", withdraw) the whoiam proof in your zone. */
-async function publishPersona(proof: string) {
-  const me = await requireIdentity();
-  const ts = Date.now(), persona = { proof, ts, sig: await me.sign(personaMsg(me.pk, proof, ts)) };
-  if (await loadZone(me.pk)) await sendDelta(await zoneId(me.pk), { records: {}, persona });
-  else await putContract(zoneWasm, unhex(me.pk), enc.encode(JSON.stringify({ records: {}, persona })));
-}
-export const unlinkPersona = () => publishPersona("");
-
-/** The whoiam persona vouching for `owner` in its zone, only if the proof holds for that key. */
-export async function zonePersona(z: Zone | null, owner: string): Promise<string | null> {
-  try {
-    const l = JSON.parse(z?.persona?.proof || "null") as Proof | null;
-    return l && (await verifyLink(l, owner)) ? l.pk : null;
-  } catch { return null; }
-}

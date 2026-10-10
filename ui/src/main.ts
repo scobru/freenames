@@ -1,7 +1,7 @@
 import "./style.css";
 import {
-  claimName, createIdentity, exportSecret, finishLink, loadPetnames, loadRegistry, loadZone, officialWhoiam, peekIdentity, personaName,
-  pinNames, REGISTRY_ADMIN, replaceIdentity, resolve, savePetnames, setRecord, startLink, unlinkPersona, webUrl, zonePersona, type Identity,
+  claimName, finishSignIn, loadPetnames, loadRegistry, loadZone, officialWhoiam, personaName, pinNames, REGISTRY_ADMIN,
+  resolve, savePetnames, session, setRecord, signOut, startSignIn, webUrl, type Session,
 } from "./lib";
 import { contractId, isKey, resolveOwner, ROOT, validName } from "./names";
 
@@ -28,7 +28,7 @@ function route() {
   const h = location.hash;
   document.querySelectorAll<HTMLElement>("[data-nav]").forEach((a) => a.toggleAttribute("aria-current", a.getAttribute("href") === (h || "#/")));
   const q = new URLSearchParams(location.search);
-  if (q.has("whoiam")) return linkCallback(q);
+  if (q.has("whoiam")) return signInCallback(q);
   if (h === "#/mine") return minePage();
   if (h === "#/how") return howPage();
   if (h === "#/admin") return adminPage();
@@ -49,8 +49,7 @@ function resolvePage(initial: string) {
     try {
       const r = await resolve(q);
       if (!r.owner) { out.innerHTML = `<p class="err">Nobody holds this name.</p>`; return; }
-      const badge = r.persona ? ` · <span class="chip" title="whoiam persona ${esc(personaName(r.persona))}">whoiam ✓ ${esc(personaName(r.persona).slice(0, 8))}…</span>` : "";
-      const who = `owner <code title="${r.owner}">${short(r.owner)}</code> (via ${r.via})${badge}`;
+      const who = `owner: whoiam persona <code title="${r.owner}">${esc(personaName(r.owner))}</code> (via ${r.via})`;
       out.innerHTML = r.target
         ? `<div class="card"><p><a class="btn primary" href="${webUrl(r.target)}" target="_blank" rel="noopener">Open ${esc(q)}</a></p>
            <p class="muted"><small>${who} · contract <code>${esc(r.target)}</code></small></p></div>`
@@ -67,29 +66,27 @@ function resolvePage(initial: string) {
 
 // ---------------- my names ----------------
 async function minePage() {
-  app.innerHTML = `<h1>My names</h1><div id="box"><p class="muted">Connecting to the node and reading your key (up to about 10 s the first time)…</p></div>`;
-  let me: Identity | null;
-  try { me = await peekIdentity(); }
+  app.innerHTML = `<h1>My names</h1><div id="box"><p class="muted">Connecting to the node (up to about 10 s the first time)…</p></div>`;
+  let me: Session | null;
+  try { me = await session(); }
   catch (e) { $("#box").innerHTML = `<p class="err">Could not reach the node: ${esc(String((e as Error).message ?? e))}</p>`; return; }
   if (!me) {
     $("#box").innerHTML = `
-      <p class="muted">Your names belong to a key kept by your node. Create one, or import a secret key you exported before.</p>
-      <p><button id="new" class="primary">Create a key</button></p>
-      <div class="card"><h2>Import</h2><div class="row"><input id="isk" type="password" placeholder="secret key (64 hex)" autocomplete="off" /><button id="imp">Import</button></div><p id="io"></p></div>`;
-    act("#new", "#io", async () => { await createIdentity(); minePage(); });
-    act("#imp", "#io", async () => { await replaceIdentity(val("#isk")); minePage(); });
+      <p class="muted">Your names belong to your <b>whoiam</b> persona. Sign in once on this node: whoiam opens, you pick a persona, and it lets this app write on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
+      <div class="row"><input id="wurl" value="${esc(officialWhoiam())}" spellcheck="false" autocomplete="off" /><button id="wgo" class="primary">Sign in with whoiam</button></div>
+      <p id="wo"></p>`;
+    act("#wgo", "#wo", async () => { goTo(await startSignIn(val("#wurl"))); return "Opening whoiam…"; });
     return;
   }
-  const pk = me.pk;
+  const pk = me.persona;
   const loading = `<tr><td class="muted">Loading from the node (can take up to 30 s)…</td></tr>`;
   $("#box").innerHTML = `
     <div class="card">
-      <h2>Key</h2>
-      <p><code class="wrap">${pk}</code></p>
-      <p class="muted"><small>Others can always reach your names as <code>${short(pk)}/name</code>, even without the registry.${me.persisted ? "" : " <b>This browser cannot keep the key: export it.</b>"}</small></p>
-      <p><button id="exp">Show secret key</button> <span id="eo"></span></p>
+      <h2>Signed in</h2>
+      <p>whoiam persona <code>${esc(personaName(pk))}</code></p>
+      <p class="muted"><small>Your persona key: <code class="wrap">${pk}</code>. Others can always reach your names as <code>&lt;this key&gt;/name</code>, even without the registry.</small></p>
+      <p><button id="so">Sign out</button></p>
     </div>
-    <div class="card" id="wc"><h2>whoiam</h2><p class="muted">Loading…</p></div>
     <div class="card">
       <h2>Your zone</h2>
       <p class="muted"><code>@</code> is what your bare name opens; any other name is a sub-name (<code>you/music</code>).</p>
@@ -108,7 +105,7 @@ async function minePage() {
       <h2>Petnames</h2>
       <p class="muted">Your own names for other people's keys. They override the registry, on this node only.</p>
       <table id="pt">${loading}</table>
-      <div class="row"><input id="pn" placeholder="name" autocomplete="off" /><input id="pk" placeholder="their key (64 hex)" autocomplete="off" /><button id="ps">Add</button></div>
+      <div class="row"><input id="pn" placeholder="name" autocomplete="off" /><input id="pk" placeholder="their persona key (64 hex)" autocomplete="off" /><button id="ps">Add</button></div>
       <p id="po"></p>
     </div>`;
   const fail = (e: unknown) => `<span class="err">${esc(String((e as Error).message ?? e))}</span>`;
@@ -123,11 +120,7 @@ async function minePage() {
       await setRecord(b.dataset.del!, "").catch((e) => alert(e));
       minePage();
     }));
-    return zonePersona(zone, pk).then(drawWhoiam);
-  }, (e) => {
-    $("#zt").innerHTML = `<tr><td>${fail(e)}</td></tr>`;
-    $("#wc").innerHTML = `<h2>whoiam</h2><p>${fail(e)}</p>`;
-  });
+  }, (e) => ($("#zt").innerHTML = `<tr><td>${fail(e)}</td></tr>`));
 
   loadRegistry().then((reg) => {
     const held = Object.keys(reg.claims).filter((n) => resolveOwner(REGISTRY_ADMIN, reg, n) === pk);
@@ -145,10 +138,7 @@ async function minePage() {
     }));
   }, (e) => ($("#pt").innerHTML = `<tr><td>${fail(e)}</td></tr>`));
 
-  $("#exp").onclick = async () => {
-    if (!confirm("Anyone who sees this key controls your names. Show it?")) return;
-    $("#eo").innerHTML = `<code class="wrap">${await exportSecret().catch((e) => esc(String(e)))}</code>`;
-  };
+  $("#so").onclick = async () => { await signOut(); minePage(); };
   act("#rs", "#ro", async () => {
     const n = val("#rn"), t = contractId(val("#rt"));
     if (n !== ROOT && !validName(n)) throw new Error("Name: lowercase letters, digits and inner hyphens.");
@@ -174,31 +164,14 @@ async function minePage() {
 // Inside the node's container the page is a sandboxed iframe: leaving it goes through the shell.
 const goTo = (href: string) => (window.parent !== window ? parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*") : void (location.href = href));
 
-/** Link a whoiam persona to your key: whoiam signs a proof, FreeNames never receives any secret. */
-function drawWhoiam(persona: string | null) {
-  const card = $("#wc");
-  if (persona) {
-    card.innerHTML = `<h2>whoiam</h2>
-      <p>Linked to the persona <code>${esc(personaName(persona))}</code>. Everyone who resolves your names sees a whoiam ✓ badge.</p>
-      <p><button id="wun" class="danger">Unlink</button> <span id="wo"></span></p>`;
-    act("#wun", "#wo", async () => { await unlinkPersona(); minePage(); });
-    return;
-  }
-  card.innerHTML = `<h2>whoiam</h2>
-    <p class="muted">Show who stands behind your names: one of your <b>whoiam</b> personas signs that it knows this key. No key or seed is shared. whoiam opens, you pick a persona, you come back here.</p>
-    <div class="row"><input id="wurl" value="${esc(officialWhoiam())}" spellcheck="false" autocomplete="off" /><button id="wgo" class="primary">Link a persona</button></div>
-    <p id="wo"></p>`;
-  act("#wgo", "#wo", async () => { goTo(await startLink(val("#wurl"))); return "Opening whoiam…"; });
-}
-
 /** whoiam sent the user back here with its proof (or a refusal). */
-async function linkCallback(q: URLSearchParams) {
-  app.innerHTML = `<h1>whoiam</h1><p class="muted">Checking the proof and publishing it in your zone…</p>`;
+async function signInCallback(q: URLSearchParams) {
+  app.innerHTML = `<h1>whoiam</h1><p class="muted">Checking the proof…</p>`;
   let html: string;
-  try { html = `<p>Linked to the persona <code>${esc(personaName(await finishLink(q)))}</code>.</p>`; }
+  try { html = `<p>Signed in as the persona <code>${esc(personaName(await finishSignIn(q)))}</code>.</p>`; }
   catch (e) { html = `<p class="err">${esc(String((e as Error).message ?? e))}</p>`; }
   history.replaceState(null, "", `${location.pathname}#/mine`); // drop the one-time query
-  app.innerHTML = `<h1>whoiam</h1>${html}<p><a class="btn primary" href="#/mine">Back to My names</a></p>`;
+  app.innerHTML = `<h1>whoiam</h1>${html}<p><a class="btn primary" href="#/mine">Go to My names</a></p>`;
 }
 
 // ---------------- how it works ----------------
@@ -207,15 +180,19 @@ function howPage() {
     <h1>How it works</h1>
     <p>Freenet addresses look like <code>6s9q7nSCmPrHY85RfPjQpdHo7WTFabDCTtsJAzHXfuLN</code>. FreeNames lets you type <code>scobru</code> or <code>scobru/freetunes</code> instead.</p>
     <div class="card">
-      <h2>1. Your zone: names under your key</h2>
-      <p>Your key is created by your node and never leaves it. Your <b>zone</b> is a contract whose address comes from your key: it maps names to contract addresses. <code>@</code> is your main site, anything else a sub-name. Only you can sign changes, so nobody can take these names from you. Anyone can reach them as <code>&lt;your key&gt;/name</code>.</p>
+      <h2>1. Your identity is your whoiam persona</h2>
+      <p>You sign in with <b>whoiam</b> once per node. whoiam signs a short delegation: "this app key, kept by your node, may write for me in FreeNames". Every change carries that delegation and the app key's signature, and the contracts check both. Your names belong to the persona, not to the app key: if you lose your node, sign in again from another one. No key or seed is shared and there is nothing to back up here.</p>
     </div>
     <div class="card">
-      <h2>2. Petnames: your own labels</h2>
-      <p>A key is not something people remember. A <b>petname</b> is your private label for someone's key (<code>ivvor</code> → their key). It lives on your node, nobody else sees it, and it always wins over the registry, so nobody can redirect your petnames.</p>
+      <h2>2. Your zone: names under your persona</h2>
+      <p>Your <b>zone</b> is a contract whose address comes from your persona key: it maps names to contract addresses. <code>@</code> is your main site, anything else a sub-name. Only your persona can authorize changes, so nobody can take these names from you. Anyone can reach them as <code>&lt;persona key&gt;/name</code>.</p>
     </div>
     <div class="card">
-      <h2>3. The registry: short public names</h2>
+      <h2>3. Petnames: your own labels</h2>
+      <p>A persona key is not something people remember. A <b>petname</b> is your private label for someone's key (<code>ivvor</code> → their key). It lives on your node, nobody else sees it, and it always wins over the registry, so nobody can redirect your petnames.</p>
+    </div>
+    <div class="card">
+      <h2>4. The registry: short public names</h2>
       <p>The <b>registry</b> maps short names to keys for everyone. Claiming a name means signing it and spending a few seconds of computing (proof of work). Freenet has no global clock, so "first come, first served" cannot be checked. Instead:</p>
       <ul>
         <li>if the registry admin <b>pinned</b> the name, the pin decides (a pin can also reserve a name);</li>
@@ -224,18 +201,14 @@ function howPage() {
       <p class="muted">So registry names are convenient but not absolute. When it matters, share your key or a petname.</p>
     </div>
     <div class="card">
-      <h2>4. Resolving a name</h2>
+      <h2>5. Resolving a name</h2>
       <p><code>name/sub</code>: <code>name</code> is a key, your petname, or a registry name, in that order. That gives an owner key. Their zone gives the address of <code>sub</code> (or <code>@</code>), which your node opens.</p>
-    </div>
-    <div class="card">
-      <h2>5. whoiam: who is behind a key</h2>
-      <p>You can link a <b>whoiam</b> persona: whoiam signs that the persona knows your FreeNames key, and the proof is published in your zone. Whoever resolves your names checks it and sees a whoiam ✓ badge. No key or seed is shared.</p>
     </div>
     <div class="card">
       <h2>Limits</h2>
       <ul>
         <li>Nodes drop contracts nobody asks for: a name stays reachable while someone keeps it hosted.</li>
-        <li>Losing your key means losing your names: export it from My names.</li>
+        <li>Whoever controls your node can write for your persona in FreeNames until you sign in elsewhere; delegations do not expire yet.</li>
         <li>Someone with more computing power can take an unpinned registry name.</li>
       </ul>
     </div>`;
