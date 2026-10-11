@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  claimName, finishSignIn, loadPetnames, loadRegistry, loadZone, officialWhoiam, personaName, pinNames, REGISTRY_ADMIN,
+  claimName, finishSignIn, loadPetnames, loadRegistry, loadZone, officialViso, personaName, pinNames, REGISTRY_ADMIN,
   resolve, savePetnames, search, session, setRecord, signOut, startSignIn, webUrl, type Session,
 } from "./lib";
 import { contractId, isKey, resolveOwner, ROOT, validName } from "./names";
@@ -94,7 +94,7 @@ async function minePage() {
   if (!me) {
     $("#box").innerHTML = `
       <p class="muted">Your names belong to your <b>Viso</b> persona. Sign in once on this node: Viso opens, you pick a persona, and it lets this app write on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
-      <div class="row"><input id="wurl" value="${esc(officialWhoiam())}" spellcheck="false" autocomplete="off" /><button id="wgo" class="primary">Sign in with Viso</button></div>
+      <div class="row"><input id="wurl" value="${esc(officialViso())}" spellcheck="false" autocomplete="off" /><button id="wgo" class="primary">Sign in with Viso</button></div>
       <p id="wo"></p>`;
     act("#wgo", "#wo", async () => { goTo(await startSignIn(val("#wurl"))); return "Opening Viso…"; });
     return;
