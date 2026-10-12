@@ -206,7 +206,7 @@ async function minePage() {
   act("#cl", "#co", async () => {
     const n = val("#cn");
     if (!validName(n)) throw new Error("Name: lowercase letters, digits and inner hyphens.");
-    $("#co").textContent = "Mining the proof of work…";
+    $("#co").textContent = "Mining the proof of work (longer if someone holds the name)…";
     await claimName(n);
     const owner = resolveOwner(REGISTRY_ADMIN, await loadRegistry(), n);
     if (owner === me.persona) { minePage(); return; }

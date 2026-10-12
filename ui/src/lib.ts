@@ -11,7 +11,7 @@ import {
   DelegateRequestType, DelegateType, InboundDelegateMsgT, InboundDelegateMsgType, RegisterDelegateT,
   RelatedContractsT, WasmDelegateV1T,
 } from "@freenetorg/freenet-stdlib/client-request";
-import { claimMsg, isKey, parseName, pinsMsg, resolveOwner, ROOT, zoneMsg, type RegState, type Zone } from "./names";
+import { claimMsg, isKey, parseName, pinsMsg, resolveOwner, ROOT, strength, zoneMsg, type RegState, type Zone } from "./names";
 import { connectMessage, verifyProof } from "./whoiam";
 export { personaName } from "./whoiam";
 import zoneWasm from "./zone.wasm?url";
@@ -236,13 +236,13 @@ const zeroBits = (h: Uint8Array) => {
   return n;
 };
 
-/** Find a nonce so that sha256(`<msg>|<nonce>`) starts with `bits` zero bits (a moment of CPU). */
-async function mine(msg: string, bits: number): Promise<number> {
-  let nonce = 0;
-  while (zeroBits(sha256(enc.encode(`${msg}|${nonce}`))) < bits) {
-    if (++nonce % 20000 === 0) await new Promise((r) => setTimeout(r)); // let the page breathe while mining
+/** Find a nonce so that sha256(`<msg>|<nonce>`) starts with `bits` zero bits and, if given, is below `beat` (hex). */
+async function mine(msg: string, bits: number, beat = ""): Promise<number> {
+  for (let nonce = 0; ; nonce++) {
+    const h = sha256(enc.encode(`${msg}|${nonce}`));
+    if (zeroBits(h) >= bits && (!beat || hex(h) < beat)) return nonce;
+    if (nonce % 20000 === 19999) await new Promise((r) => setTimeout(r)); // let the page breathe while mining
   }
-  return nonce;
 }
 
 
@@ -343,10 +343,14 @@ export async function loadRegistry(): Promise<RegState> {
 export async function claimName(name: string) {
   const me = await requireSession();
   const msg = claimMsg(REGISTRY_ADMIN, name, me.persona);
-  const sig = await me.sign(msg), nonce = await mine(msg, POW_BITS);
+  const reg = await loadRegistry(); // also makes sure it exists and caches its full key for the update
+  if (name in reg.pins.map) throw new Error("The registry admin pinned this name: no proof of work can take it.");
+  // to take a held name, the proof must be stronger (lower) than every other owner's
+  const beat = Object.entries(reg.claims[name] ?? {}).filter(([o]) => o !== me.persona)
+    .map(([o, c]) => strength(REGISTRY_ADMIN, name, o, c.nonce)).sort()[0];
+  const sig = await me.sign(msg), nonce = await mine(msg, POW_BITS, beat);
   const prev = await myClaims(me.persona);
   await storePut(`claims-${me.persona}`, JSON.stringify({ ...prev, [name]: { nonce, sig, cert: me.cert } }));
-  await loadRegistry(); // makes sure it exists and caches its full key for the update
   await sendClaims(me.persona, [name]);
 }
 
