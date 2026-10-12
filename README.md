@@ -18,6 +18,8 @@ Your identity is your [whoiam](https://github.com/skandragon/freenet-whoiam) per
 
 Resolution: `first/sub` → `first` is a 64-hex persona key, else your petname, else the registry → the owner's zone → record `sub` (or `@`, the zone root, when there is no `/sub`) → contract id → `http://<node>/v1/contract/web/<id>/`.
 
+Building an app that resolves FreeNames names or links to them? See [docs/integration.md](docs/integration.md).
+
 ## Design
 
 | Part | What it holds | Address |
