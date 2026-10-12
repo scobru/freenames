@@ -165,7 +165,10 @@ async function minePage() {
     const held = Object.keys(reg.claims).filter((n) => resolveOwner(REGISTRY_ADMIN, reg, n) === pk);
     const sent = await resendMissingClaims(pk, reg).catch(() => []);
     const list = (ns: string[]) => ns.map((n) => `<code>${esc(n)}</code>`).join(", ");
+    // claims of ours the registry has but gives to someone else (a pin or a stronger proof)
+    const lost = Object.keys(reg.claims).filter((n) => reg.claims[n][pk] && !held.includes(n));
     $("#held").innerHTML = (held.length ? `You hold: ${list(held)}` : "You hold no registry name.")
+      + (lost.length ? ` Claimed but held by another key (a pin or a stronger proof): ${list(lost)}.` : "")
       + (sent.length ? ` Not in the registry yet, sent again: ${list(sent)}.` : "");
   }, (e) => ($("#held").innerHTML = fail(e)));
 
@@ -205,7 +208,11 @@ async function minePage() {
     if (!validName(n)) throw new Error("Name: lowercase letters, digits and inner hyphens.");
     $("#co").textContent = "Mining the proof of work…";
     await claimName(n);
-    return `Claimed. It resolves to you unless a stronger claim or a pin says otherwise.`;
+    const owner = resolveOwner(REGISTRY_ADMIN, await loadRegistry(), n);
+    if (owner === me.persona) { minePage(); return; }
+    return owner
+      ? `Sent, but ${n} belongs to ${personaName(owner)} (a pin or a stronger proof).`
+      : `Sent. The registry on this node does not show it yet: reload in a minute.`;
   });
   act("#ps", "#po", async () => {
     const n = val("#pn"), k = val("#pk").toLowerCase();
