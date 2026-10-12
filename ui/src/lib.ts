@@ -102,13 +102,13 @@ const keys = new Map<string, ContractKey>();
 const fullKey = (instance: string) => keys.get(instance) ?? ContractKey.fromInstanceId(instance);
 
 /** Raw state of a contract. */
-export const getState = (instance: string) =>
+export const getState = (instance: string, subscribe = false) =>
   serial(() => retrying(async () => {
-    const r = await (await api()).get(new GetRequest(fullKey(instance), false));
+    const r = await (await api()).get(new GetRequest(fullKey(instance), false, subscribe));
     if (r.key?.codePart()?.length === 32) keys.set(instance, r.key);
     return new Uint8Array(r.state);
   }));
-const getJson = async <T>(instance: string) => JSON.parse(new TextDecoder().decode(await getState(instance))) as T;
+const getJson = async <T>(instance: string, subscribe = false) => JSON.parse(new TextDecoder().decode(await getState(instance, subscribe))) as T;
 
 async function sendDelta(instance: string, delta: object) {
   const d = new UpdateData(UpdateDataType.DeltaUpdate, new DeltaUpdate(bytes(JSON.stringify(delta))));
@@ -329,10 +329,10 @@ let regId: Promise<string> | undefined;
 const registryId = () => (regId ??= keyOf(registryWasm, withApp(REGISTRY_ADMIN)).then((k) => k.encode()));
 const EMPTY_REG: RegState = { claims: {}, pins: { ts: 0, map: {}, sig: "" } };
 
-/** Load the registry. The first visitor on a node creates it (empty). */
+/** Load the registry. The first visitor on a node creates it (empty). Subscribing keeps the node's copy fresh. */
 export async function loadRegistry(): Promise<RegState> {
   const id = await registryId();
-  try { return await getJson<RegState>(id); }
+  try { return await getJson<RegState>(id, true); }
   catch {
     await putContract(registryWasm, withApp(REGISTRY_ADMIN), enc.encode(JSON.stringify(EMPTY_REG)));
     return getJson<RegState>(id);
@@ -344,8 +344,26 @@ export async function claimName(name: string) {
   const me = await requireSession();
   const msg = claimMsg(REGISTRY_ADMIN, name, me.persona);
   const sig = await me.sign(msg), nonce = await mine(msg, POW_BITS);
+  const prev = await myClaims(me.persona);
+  await storePut(`claims-${me.persona}`, JSON.stringify({ ...prev, [name]: { nonce, sig, cert: me.cert } }));
   await loadRegistry(); // makes sure it exists and caches its full key for the update
-  await sendDelta(await registryId(), { claims: { [name]: { [me.persona]: { nonce, sig, cert: me.cert } } } });
+  await sendClaims(me.persona, [name]);
+}
+
+/** Claims this persona made from this node, kept so they can be sent again if the registry copy lost them. */
+const myClaims = async (persona: string): Promise<Record<string, object>> => JSON.parse((await storeGet(`claims-${persona}`)) || "{}");
+
+async function sendClaims(persona: string, names: string[]) {
+  const all = await myClaims(persona);
+  const claims = Object.fromEntries(names.filter((n) => all[n]).map((n) => [n, { [persona]: all[n] }]));
+  await sendDelta(await registryId(), { claims });
+}
+
+/** Send again the claims of ours the registry does not show; returns their names. */
+export async function resendMissingClaims(persona: string, reg: RegState): Promise<string[]> {
+  const missing = Object.keys(await myClaims(persona)).filter((n) => !reg.claims[n]?.[persona]);
+  if (missing.length) await sendClaims(persona, missing);
+  return missing;
 }
 
 /** Admin only: replace the pins (name -> persona key, "" reserves the name). */

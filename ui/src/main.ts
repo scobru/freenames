@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  claimName, createLocalIdentity, finishSignIn, localIdentityKey, loadPetnames, loadRegistry, loadZone, officialViso, personaName, pinNames, REGISTRY_ADMIN,
+  claimName, createLocalIdentity, finishSignIn, localIdentityKey, resendMissingClaims, loadPetnames, loadRegistry, loadZone, officialViso, personaName, pinNames, REGISTRY_ADMIN,
   resolve, savePetnames, search, session, setRecord, signOut, startSignIn, webUrl, type Session,
 } from "./lib";
 import { contractId, isKey, resolveOwner, ROOT, validName } from "./names";
@@ -161,9 +161,12 @@ async function minePage() {
     }));
   }, (e) => ($("#zt").innerHTML = `<tr><td>${fail(e)}</td></tr>`));
 
-  loadRegistry().then((reg) => {
+  loadRegistry().then(async (reg) => {
     const held = Object.keys(reg.claims).filter((n) => resolveOwner(REGISTRY_ADMIN, reg, n) === pk);
-    $("#held").innerHTML = held.length ? `You hold: ${held.map((n) => `<code>${esc(n)}</code>`).join(", ")}` : "You hold no registry name.";
+    const sent = await resendMissingClaims(pk, reg).catch(() => []);
+    const list = (ns: string[]) => ns.map((n) => `<code>${esc(n)}</code>`).join(", ");
+    $("#held").innerHTML = (held.length ? `You hold: ${list(held)}` : "You hold no registry name.")
+      + (sent.length ? ` Not in the registry yet, sent again: ${list(sent)}.` : "");
   }, (e) => ($("#held").innerHTML = fail(e)));
 
   let pets: Record<string, string> = {};
