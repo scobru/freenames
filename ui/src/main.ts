@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  claimName, finishSignIn, resendMissingClaims, loadPetnames, loadRegistry, loadZone, officialViso, personaName, pinNames, REGISTRY_ADMIN,
+  claimName, createLocalIdentity, finishSignIn, localIdentityKey, resendMissingClaims, loadPetnames, loadRegistry, loadZone, officialViso, personaName, pinNames, REGISTRY_ADMIN,
   resolve, savePetnames, search, session, setRecord, signOut, startSignIn, webUrl, type Session,
 } from "./lib";
 import { contractId, isKey, resolveOwner, ROOT, validName } from "./names";
@@ -92,22 +92,40 @@ async function minePage() {
   try { me = await session(); }
   catch (e) { $("#box").innerHTML = `<p class="err">Could not reach the node: ${esc(String((e as Error).message ?? e))}</p>`; return; }
   if (!me) {
+    const kept = await localIdentityKey(); // made here, but this node's app key changed: sign for it again
+    if (kept) { try { await createLocalIdentity(kept); return void (await minePage()); } catch { /* show the choices */ } }
     $("#box").innerHTML = `
       <p class="muted">Your names belong to your <b>Viso</b> persona. Sign in once on this node: Viso opens, you pick a persona, and it lets this app write on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
       <div class="row"><input id="wurl" value="${esc(officialViso())}" spellcheck="false" autocomplete="off" /><button id="wgo" class="primary">Sign in with Viso</button></div>
-      <p id="wo"></p>`;
+      <p id="wo"></p>
+      <div class="card">
+        <h2>Or create an identity here</h2>
+        <p class="muted">No Viso needed: FreeNames makes a new key on this node. You get a key to back up, and pasting it here (in this or another Freenet app, on any node) brings the same identity back.</p>
+        <p><button id="lnew">Create identity</button></p>
+        <div class="row"><input id="lkey" type="password" placeholder="Already have a key? Paste it (64 hexadecimal characters)" spellcheck="false" autocomplete="off" /><button id="limport">Use this key</button></div>
+        <p id="lo"></p>
+      </div>`;
     act("#wgo", "#wo", async () => { goTo(await startSignIn(val("#wurl"))); return "Opening Viso…"; });
+    act("#lnew", "#lo", async () => { await createLocalIdentity(); await minePage(); });
+    act("#limport", "#lo", async () => { await createLocalIdentity(val("#lkey")); await minePage(); });
     return;
   }
   const pk = me.persona;
+  const key = await localIdentityKey();
   const loading = `<tr><td class="muted">Loading from the node (can take up to 30 s)…</td></tr>`;
   $("#box").innerHTML = `
     <div class="card">
       <h2>Signed in</h2>
-      <p>Viso persona <code>${esc(personaName(pk))}</code></p>
+      <p>${key ? "Identity" : "Viso persona"} <code>${esc(personaName(pk))}</code></p>
       <p class="muted"><small>Your persona key: <code class="wrap">${pk}</code>. Others can always reach your names as <code>&lt;this key&gt;/name</code>, even without the registry.</small></p>
       <p><button id="so">Sign out</button></p>
     </div>
+    ${key ? `<div class="card">
+      <h2>Back up your key</h2>
+      <p class="muted">This identity was made here, so this key is the only way to get it back. Keep it secret: whoever has it controls your names.</p>
+      <p><button id="kshow">Show key</button> <button id="kdl">Download key</button></p>
+      <p><code id="kval" class="wrap" hidden>${esc(key)}</code></p>
+    </div>` : ""}
     <div class="card">
       <h2>Your zone</h2>
       <p class="muted"><code>@</code> is what your bare name opens; any other name is a sub-name (<code>you/music</code>).</p>
@@ -162,7 +180,19 @@ async function minePage() {
     }));
   }, (e) => ($("#pt").innerHTML = `<tr><td>${fail(e)}</td></tr>`));
 
-  $("#so").onclick = async () => { await signOut(); minePage(); };
+  if (key) {
+    $("#kshow").onclick = () => { $("#kval").hidden = !$("#kval").hidden; };
+    $("#kdl").onclick = () => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([`FreeNames identity key: keep it secret.\n${key}\n`], { type: "text/plain" }));
+      a.download = `identity-${personaName(pk).slice(0, 8)}.txt`;
+      a.click();
+    };
+  }
+  $("#so").onclick = async () => {
+    if (key && !confirm("Signing out deletes the key from this node. Without your backup this identity is lost. Sign out?")) return;
+    await signOut(); minePage();
+  };
   act("#rs", "#ro", async () => {
     const n = val("#rn"), t = contractId(val("#rt"));
     if (n !== ROOT && !validName(n)) throw new Error("Name: lowercase letters, digits and inner hyphens.");
